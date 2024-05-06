@@ -1,0 +1,327 @@
+#!/usr/bin/env python
+# -- coding: utf-8 --
+# @Time : 2/26/2024 12:13 AM
+# @Author : Yi Chen
+# @File :For_NSCLC.py
+
+import os
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import GridSearchCV
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+
+
+
+def map_rename(df, suffix):
+    columns_to_suffix = df.columns[1:]
+    rename_mapping = {col: col + suffix for col in columns_to_suffix if col in df.columns[1:]}
+    df.rename(columns=rename_mapping, inplace=True)
+    return df
+
+
+# -------------------------------------Feature selection stage---------------------------------------------
+def remove_high_corr_no_variance(df):
+    df_ori = df.copy()
+    df = df[df.columns[1:]]
+    select_feature_list = []
+    var_features = df.var().sort_values()
+    df = df[var_features[var_features > 0.01].index]
+    for var in df.columns:
+        sigle_rate = (df[var].value_counts().max() / df.shape[0])
+        if sigle_rate < 0.9:
+            select_feature_list.append(var)
+    df = df[select_feature_list]
+
+    cor = df.corr('spearman').abs()
+    upper_tri = cor.where(np.triu(np.ones(cor.shape), k=1).astype(bool))
+    to_drop = []
+    for column in upper_tri.columns:
+        for row in upper_tri.columns:
+            if upper_tri[column][row] > 0.85:
+                if np.sum(upper_tri[column]) > np.sum(
+                        upper_tri[row]):
+                    to_drop.append(column)
+                else:
+                    to_drop.append(row)
+    to_drop = np.unique(to_drop)
+    df_ori.drop(to_drop, axis=1, inplace=True)
+    constant_columns = [col for col in df_ori.columns if df_ori[col].nunique() == 1]
+    df_ori.drop(columns=constant_columns, inplace=True)
+    return df_ori
+
+
+# ---------------------------------------model selected features-------------------------------------
+
+def fold_Lasso_selected(df, outcome):
+    from sksurv.linear_model import CoxnetSurvivalAnalysis
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.preprocessing import StandardScaler
+    from collections import Counter
+
+    feature_candidate = []
+    outcome_input = list(zip(outcome['event'].astype(bool), outcome['time']))
+    outcome_structured = np.array(outcome_input, dtype=[('Event', 'bool'), ('Time', 'float')])
+    feature = df.iloc[:, 1:]
+
+    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+    for train_idx, test_idx in kf.split(feature, outcome['event'].astype(bool)):
+        scale = StandardScaler()
+        feature_train = scale.fit_transform(feature.iloc[train_idx])
+        outcome_train = outcome_structured[train_idx]
+
+        model = CoxnetSurvivalAnalysis(l1_ratio=1.0, alpha_min_ratio=0.1, n_alphas=100)
+        model.fit(feature_train, outcome_train)
+        coefficients = abs(np.sum(model.coef_, axis=1))
+        sorted_indices = np.argsort(coefficients)[::-1]
+        coefficients_new = coefficients[sorted_indices]
+        indict = np.argmax(np.diff(coefficients_new))
+        select_featuer = feature.columns[sorted_indices[:indict]]
+        feature_candidate.extend(select_featuer)
+    count = Counter(feature_candidate)
+    keys_with_count_five = [key for key, value in count.items() if value >= 4]
+    print(f"Common top features across all folds: {keys_with_count_five}")
+    return keys_with_count_five
+
+
+def test_predict_calculate_cox(test_feature, outcome_test, train_feature, outcome_train, columns):
+    # import shap
+    from sksurv.linear_model import CoxnetSurvivalAnalysis
+    from sksurv.metrics import concordance_index_censored
+
+
+    outcome_train = list(zip(outcome_train['event'].astype(bool), outcome_train['time']))
+    outcome_structured_train = np.array(outcome_train, dtype=[('Event', 'bool'), ('Time', 'float')])
+
+    rsf = CoxnetSurvivalAnalysis(l1_ratio=1.0, alpha_min_ratio=0.1, n_alphas=100)
+    rsf.fit(train_feature, outcome_structured_train)
+
+    print('-----------------------------CoxnetSurvivalAnalysis Feature importance--------------------------------------')
+    coefficients = rsf.coef_
+    contribute = coefficients.mean(axis=1)
+    for i in range(len(contribute)):
+        print(f'{columns[i]}: {contribute[i]}')
+
+    c_index = concordance_index_censored(outcome_test['event'].astype(bool),
+                                         outcome_test['time'],
+                                         rsf.predict(test_feature))
+    print(
+        '-----------------------------CoxnetSurvivalAnalysis C-index: --------------------------------------')
+    print(f'cox model c_index:{c_index[0]}')
+
+#---------------------------------------random forest model feature selection---------------------------------------
+def fold_rsf_selected(df, outcome):
+    from sklearn.model_selection import StratifiedKFold
+    from sksurv.ensemble import RandomSurvivalForest
+    from sklearn.inspection import permutation_importance
+    from collections import Counter
+
+    feature_candidate = []
+    outcome_input = list(zip(outcome['event'].astype(bool), outcome['time']))
+    outcome_structured = np.array(outcome_input, dtype=[('Event', 'bool'), ('Time', 'float')])
+    feature = df.iloc[:, 1:]
+
+    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+    for train_idx, test_idx in kf.split(feature, outcome['event'].astype(bool)):
+        scale = StandardScaler()
+        feature_train = scale.fit_transform(feature.iloc[train_idx])
+        outcome_train = outcome_structured[train_idx]
+
+        rsf = RandomSurvivalForest()
+        param_grid = {
+            'n_estimators': [100, 200],
+            'max_depth': [5, 10, 15],
+            'min_samples_split': [2, 4, 6, 8, 10],
+            'max_features': ['sqrt', 'log2']
+        }
+        skf = StratifiedKFold(n_splits=3)
+        grid = GridSearchCV(estimator=rsf, param_grid=param_grid, cv=skf)
+        grid.fit(feature_train, outcome_train)
+        best_params = grid.best_params_
+        best_model = RandomSurvivalForest(**best_params)
+        best_model.fit(feature_train, outcome_train)
+        perm_importance = permutation_importance(best_model, feature_train, outcome_train, n_repeats=30, random_state=42)
+        feature_importances = perm_importance.importances_mean
+        sorted_indices = np.argsort(feature_importances)[::-1]
+        coefficients_new = feature_importances[sorted_indices]
+        indict = np.argmax(np.diff(coefficients_new))
+        select_featuer = feature.columns[sorted_indices[:indict]]
+        feature_candidate.extend(select_featuer)
+    count = Counter(feature_candidate)
+    keys_with_count_five = [key for key, value in count.items() if value >= 2]
+    print(f"Common top features across all folds: {keys_with_count_five}")
+    return keys_with_count_five
+
+def test_predict_calculate_rsf(test_feature, outcome_test, train_feature, outcome_train, columns):
+    from sksurv.ensemble import RandomSurvivalForest
+    from sksurv.metrics import concordance_index_censored
+    from sklearn.inspection import permutation_importance
+
+    outcome_train = list(zip(outcome_train['event'].astype(bool), outcome_train['time']))
+    outcome_structured_train = np.array(outcome_train, dtype=[('Event', 'bool'), ('Time', 'float')])
+
+    rsf = RandomSurvivalForest()
+    param_grid = {
+        'n_estimators': [100, 200],
+        'max_depth': [5, 10, 15],
+        'min_samples_split': [2, 10],
+        'max_features': ['sqrt', 'log2']
+    }
+
+    grid = GridSearchCV(estimator=rsf, param_grid=param_grid, cv=5)
+    grid.fit(train_feature, outcome_structured_train)
+    print("Best parameters:", grid.best_params_)
+    print("Best cross-validation score: {:.3f}".format(grid.best_score_))
+    print(
+        '-----------------------------Random forest Feature importance--------------------------------------')
+    best_model = grid.best_estimator_
+    perm_importance = permutation_importance(best_model, train_feature, outcome_structured_train, n_repeats=30, random_state=42)
+    feature_importances = perm_importance.importances_mean
+    for i in range(len(columns)):
+        print(f'{columns[i]}: {feature_importances[i]}')
+    print(
+        '-----------------------------RandomSurvivalForest C-index--------------------------------------')
+
+    c_index = concordance_index_censored(outcome_test['event'].astype(bool),
+                                         outcome_test['time'],
+                                         best_model.predict(test_feature))
+    print(f'Random forest model -c_index:{c_index[0]}')
+
+
+#---------------------------------------Gridient Boost feature selection---------------------------------------
+def fold_GBS_feature_selected(df, outcome):
+    from sklearn.model_selection import StratifiedKFold
+    from sksurv.ensemble import ComponentwiseGradientBoostingSurvivalAnalysis
+    from sksurv.ensemble import GradientBoostingSurvivalAnalysis
+    from sklearn.inspection import permutation_importance
+    from collections import Counter
+
+    est_cph_tree = GradientBoostingSurvivalAnalysis(n_estimators=100, learning_rate=1.0, max_depth=1, random_state=0)
+
+    feature = df.iloc[:, 1:]
+    outcome_input = list(zip(outcome['event'].astype(bool), outcome['time']))
+    outcome_structured = np.array(outcome_input, dtype=[('Event', 'bool'), ('Time', 'float')])
+    skf = StratifiedKFold(n_splits=5)
+    feature_candidate = []
+
+    for train_index, test_index in skf.split(feature, outcome['event'].astype(bool)):
+        X_train, X_test = feature.iloc[train_index], feature.iloc[test_index]
+        y_train, y_test = outcome_structured[train_index], outcome_structured[test_index]
+
+        # Build and train the model
+        est_cph_tree = GradientBoostingSurvivalAnalysis(n_estimators=100, learning_rate=1.0, max_depth=1,
+                                                        random_state=0)
+        est_cph_tree.fit(X_train, y_train)
+        # perm_importance = permutation_importance(est_cph_tree, X_train, y_train, n_repeats=30, random_state=42)
+        feature_importances = est_cph_tree.feature_importances_
+        sorted_indices = np.argsort(feature_importances)[::-1]
+
+        # top_ten_indices = sorted_indices[:10]
+        coefficients_new = feature_importances[sorted_indices]
+        indict = np.argmax(np.diff(coefficients_new))
+        select_featuer = feature.columns[sorted_indices[:indict]]
+        feature_candidate.extend(select_featuer)
+
+    count = Counter(feature_candidate)
+    keys_with_count_five = [key for key, value in count.items() if value >= 4]
+    print(f"Common top features across all folds: {keys_with_count_five}")
+    return keys_with_count_five
+
+
+def test_predict_calculate_GBS(test_feature, outcome_test, train_feature, outcome_train, columns):
+    from sksurv.ensemble import GradientBoostingSurvivalAnalysis
+    from sksurv.metrics import concordance_index_censored
+    from sklearn.inspection import permutation_importance
+
+    outcome_train = list(zip(outcome_train['event'].astype(bool), outcome_train['time']))
+    outcome_structured_train = np.array(outcome_train, dtype=[('Event', 'bool'), ('Time', 'float')])
+
+    outcome_test_struct = list(zip(outcome_test['event'].astype(bool), outcome_test['time']))
+    outcome_structured_test = np.array(outcome_test_struct, dtype=[('Event', 'bool'), ('Time', 'float')])
+
+    rsf = GradientBoostingSurvivalAnalysis(random_state=1234)
+    param_grid={
+        'n_estimators': [100, 200],
+        'max_depth': [5, 10, 15],
+        'learning_rate': [1e-4, 1e-2, 1.0]
+    }
+
+    grid = GridSearchCV(estimator=rsf, param_grid=param_grid, cv=5)
+    grid.fit(train_feature, outcome_structured_train)
+    print("Best parameters:", grid.best_params_)
+    print("Best cross-validation score: {:.3f}".format(grid.best_score_))
+
+    print(
+            '-----------------------------GradientBoostingSurvivalAnalysis Feature importance--------------------------------------')
+    best_model = grid.best_estimator_
+    perm_importance = permutation_importance(best_model, train_feature, outcome_structured_train,
+                                             n_repeats=30, random_state=42)
+    feature_importances = perm_importance.importances_mean
+    for i in range(len(columns)):
+        print(f'{columns[i]}: {feature_importances[i]}')
+    print(
+        '-----------------------------RandomSurvivalForest C-index--------------------------------------')
+
+
+    c_index = concordance_index_censored(outcome_test['event'].astype(bool),
+                                         outcome_test['time'],
+                                         best_model.predict(test_feature))
+
+    print(f'GBS model-- c_index:{c_index[0]}')
+
+
+#-------------------------------------------Main function-------------------------------------------------------
+def Load_radiomics(patient_list):
+
+    outcome_file = pd.read_excel('data.xlsx')
+    outcome = outcome_file[['NO', 'event', 'time']]  # Name censor time
+    outcome_patient = outcome[outcome['NO'].isin(patient_list)]
+
+    radiomics_Feature = pd.read_excel('Radiomics_File.xlsx').rename(columns={'RowName': 'NO'})
+    radiomics_Feature.drop(radiomics_Feature.columns[1:23], axis=1, inplace=True)
+
+
+
+    test_patient = [file for file in patient_list if 'AMC' in file]
+    train_patient = list(set(patient_list).difference(set(test_patient)))
+
+    Img_train = radiomics_Feature[radiomics_Feature['NO'].isin(train_patient)].reset_index(drop=True)
+    outcome_train = outcome[outcome['NO'].isin(train_patient)].reset_index(drop=True)
+
+    Img_test = radiomics_Feature[radiomics_Feature['NO'].isin(test_patient)].reset_index(drop=True)
+    outcome_test = outcome[outcome['NO'].isin(test_patient)].reset_index(drop=True)
+
+
+    remove_nonvari_all_sequence_train = remove_high_corr_no_variance(Img_train)
+    remove_nonvari_all_sequence_test = Img_test[remove_nonvari_all_sequence_train.columns]
+
+    select_feature_by_Lasso = fold_Lasso_selected(remove_nonvari_all_sequence_train, outcome_train)
+    scale = StandardScaler()
+    select_feature_train = scale.fit_transform(remove_nonvari_all_sequence_train[select_feature_by_Lasso])
+    select_feature_test = scale.transform(remove_nonvari_all_sequence_test[select_feature_by_Lasso])
+    test_predict_calculate_cox(select_feature_test, outcome_test, select_feature_train, outcome_train, select_feature_by_Lasso)
+
+
+    select_feature_by_rsf = fold_rsf_selected(remove_nonvari_all_sequence_train, outcome_train)
+    if len(select_feature_by_rsf)>0:
+        scale = StandardScaler()
+        select_feature_train = scale.fit_transform(remove_nonvari_all_sequence_train[select_feature_by_rsf])
+        select_feature_test = scale.transform(remove_nonvari_all_sequence_test[select_feature_by_rsf])
+        test_predict_calculate_rsf(select_feature_test, outcome_test, select_feature_train, outcome_train,
+                                   select_feature_by_rsf)
+
+    select_feature_by_GBS = fold_GBS_feature_selected(remove_nonvari_all_sequence_train, outcome_train)
+    if len(select_feature_by_GBS)>0:
+        scale = StandardScaler()
+        select_feature_train = scale.fit_transform(remove_nonvari_all_sequence_train[select_feature_by_GBS])
+        select_feature_test = scale.transform(remove_nonvari_all_sequence_test[select_feature_by_GBS])
+        test_predict_calculate_GBS(select_feature_test, outcome_test, select_feature_train, outcome_train,
+                                   select_feature_by_GBS)
+
+
+
+
+if __name__ == '__main__':
+    Patient_ID = os.listdir('./Imge_path')
+    Load_radiomics(patient_list=Patient_ID)
