@@ -75,7 +75,7 @@ def Lasso(df, outcome):
     from sklearn.linear_model import LassoCV
     from sklearn.preprocessing import StandardScaler
 
-    y = outcome['statusipsiKLINISCH']
+    y = outcome['PFS_boolean']
     scale = StandardScaler()
     feature = scale.fit_transform(df.iloc[:, 1:])
     lasso = LassoCV(cv=5, random_state=42, max_iter=10000)
