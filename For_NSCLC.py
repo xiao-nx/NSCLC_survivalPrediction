@@ -54,6 +54,25 @@ def remove_high_corr_no_variance(df):
 
 
 # ---------------------------------------model selected features-------------------------------------
+def Lasso(df, outcome):
+    from sklearn.feature_selection import RFE
+    from sklearn.linear_model import LassoCV
+    from sklearn.preprocessing import StandardScaler
+
+    y = outcome['PFS_boolean']
+    scale = StandardScaler()
+    feature = scale.fit_transform(df.iloc[:, 1:])
+    lasso = LassoCV(cv=5, random_state=42, max_iter=10000)
+    lasso.fit(feature, y)
+    lasso_coefs = lasso.coef_
+
+    featuer_name = df.columns[1:]
+    important_features = featuer_name[lasso_coefs != 0]
+
+    print("Important features selected by LASSO:")
+    print(important_features)
+    return important_features
+
 
 def fold_Lasso_selected(df, outcome):
     from sksurv.linear_model import CoxnetSurvivalAnalysis
